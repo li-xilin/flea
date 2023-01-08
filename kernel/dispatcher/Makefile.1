@@ -1,0 +1,39 @@
+AS = nasm
+CC = i686-w64-mingw32-gcc
+LINK = ld
+AR = i686-w64-mingw32-gcc-ar
+LD = i686-w64-mingw32-gcc-ld
+RM = rm -f
+
+CFLAGS += -Wall -Werror -std=c99  -I ../public -I ./include
+
+ASFLAGS += -fwin -Ox
+CFLAGS += -Wall -fno-stack-protector -fno-builtin -Wno-builtin-declaration-mismatch -Wno-strict-aliasing -std=c99 -m32 -ffreestanding -nostdlib -nodefaultlibs
+
+#CFLAGS += -Wall  -fno-builtin -Wno-builtin-declaration-mismatch -std=c99 -Os -m32 -ffreestanding #-nostdlib -nodefaultlibs
+
+OBJS = main.o server.o api.o
+
+all: code.c
+
+server.pe: CFLAGS += -DNDEBUG -O2
+server.pe: $(OBJS)
+	$(LINK) $(LDFLAGS) -e _start -m i386pe -o $@ -\( $^ -\)
+
+server.exe: CFLAGS += -O0 -g -DDEBUG_BUILD
+server.exe: LDFLAGS += -lws2_32 -ldnsapi
+server.exe: $(OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+server.bin: server.pe
+	objcopy -O binary -j .text $^ $@
+	@stat -c "Payload total %s bytes." $@
+disas: server.bin
+	ndisasm -b32 $^
+test: test.c code.c
+	$(CC) -fno-stack-protector -g -o test.exe $^ -ldnsapi
+code.c: server.bin
+	xxd -i $< $@
+clean:
+	$(RM) *.o *.exe *.pe *.bin code.c
+

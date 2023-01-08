@@ -1,0 +1,470 @@
+#define COBJMACROS
+#define STRSAFE_NO_DEPRECATE
+#include <qedit.h>
+#include <dshow.h>
+#include <wincodec.h>
+#include <combaseapi.h>
+#include <amvideo.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
+
+#define SIZE_PREHEADER offsetof(VIDEOINFOHEADER, bmiHeader);
+
+EXTERN_C const CLSID CLSID_NullRenderer;
+EXTERN_C const CLSID CLSID_SampleGrabber;
+
+int RGB24BufferToJpeg(LPBYTE buffer, int width, int height,LPCWSTR filePath);
+
+int SaveImage(const char *szFileName, AM_MEDIA_TYPE *mediaType, LPBYTE pBuffer, size_t nBufferSize)
+{
+	VIDEOINFOHEADER *pVih = (VIDEOINFOHEADER*)mediaType->pbFormat;
+	printf("color = %d\n", pVih->bmiHeader.biBitCount);
+	// Print the resolution of the captured image
+	fprintf(stderr, "Capture resolution: %dx%d\n", pVih->bmiHeader.biWidth, pVih->bmiHeader.biHeight);
+
+	long cbBitmapInfoSize = mediaType->cbFormat - SIZE_PREHEADER;
+	BITMAPFILEHEADER bfh;
+	ZeroMemory(&bfh, sizeof(bfh));
+	bfh.bfType = 'M' << 8 | 'B'; // Little-endian for "BM".
+	bfh.bfSize = sizeof(bfh) + nBufferSize + cbBitmapInfoSize;
+	bfh.bfOffBits = sizeof(BITMAPFILEHEADER) + cbBitmapInfoSize;
+
+	HANDLE hf = CreateFile(szFileName, GENERIC_WRITE,
+			FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 0, NULL);
+	if (hf == INVALID_HANDLE_VALUE) {
+		puts("CreateFile");
+		goto out;
+	}
+
+	DWORD dwWritten = 0;
+	WriteFile(hf, &bfh, sizeof(bfh), &dwWritten, NULL);
+	WriteFile(hf, (LPVOID)&pVih->bmiHeader, cbBitmapInfoSize, &dwWritten, NULL);
+
+	// Write pixel data to file
+	WriteFile(hf, pBuffer, nBufferSize, &dwWritten, NULL);
+	CloseHandle(hf);
+out:
+	return -1;
+}
+
+int ListDevice()
+{
+	int retval = -1;
+	HRESULT hr;
+
+	ICreateDevEnum *pDevEnum = NULL;
+	IEnumMoniker *pEnum = NULL;
+
+	hr = CoCreateInstance(&CLSID_SystemDeviceEnum, NULL,CLSCTX_INPROC_SERVER, &IID_ICreateDevEnum, (LPVOID *)&pDevEnum);
+	if (hr != S_OK) {
+		goto out;
+	}
+
+	hr = ICreateDevEnum_CreateClassEnumerator(pDevEnum, &CLSID_VideoInputDeviceCategory, &pEnum, 0);
+	if (hr != S_OK) {
+		goto out;
+	}
+
+	IMoniker *pMoniker = NULL;
+	for (int i = 0; (IEnumMoniker_Next(pEnum, 1, &pMoniker, NULL)) == S_OK; i++) {
+
+		IPropertyBag *pPropBag = NULL;
+		hr = IMoniker_BindToStorage(pMoniker, 0, 0, &IID_IPropertyBag, (LPVOID *)&pPropBag);
+
+		VARIANT var;
+		VariantInit(&var);
+
+		hr = IPropertyBag_Read(pPropBag, L"FriendlyName", &var, 0);
+		fprintf(stderr, "%d. %ls\n", i, var.bstrVal);
+
+		VariantClear(&var);
+
+		IMoniker_Release(pMoniker);
+	}
+out:
+	if (pEnum != NULL)
+		IEnumMoniker_Release(pEnum);
+	if (pDevEnum != NULL)
+		ICreateDevEnum_Release(pDevEnum);
+	return 0;
+}
+
+int Capture()
+{
+	int retval = -1;
+
+	HRESULT hr;
+	ICreateDevEnum *pDevEnum = NULL;
+	IEnumMoniker *pEnum = NULL;
+	IMoniker *pMoniker = NULL;
+	IPropertyBag *pPropBag = NULL;
+	IGraphBuilder *pGraph = NULL;
+	ICaptureGraphBuilder2 *pBuilder = NULL;
+	IBaseFilter *pCap = NULL;
+	IBaseFilter *pSampleGrabberFilter = NULL;
+	ISampleGrabber *pSampleGrabber = NULL;
+	IBaseFilter *pNullRenderer = NULL;
+	IMediaControl *pMediaControl = NULL;
+	LPBYTE pBuffer = NULL;
+
+	// Capture settings
+	int device_number = 0;
+	char device_name[100];
+
+	hr = CoCreateInstance(&CLSID_FilterGraph, NULL, CLSCTX_INPROC_SERVER, &IID_IGraphBuilder, (LPVOID *)&pGraph);
+	if (hr != S_OK) {
+		puts("Could not create filter graph");
+		goto out;
+	}
+	
+	// Create capture graph builder.
+	hr = CoCreateInstance(&CLSID_CaptureGraphBuilder2, NULL, CLSCTX_INPROC_SERVER, &IID_ICaptureGraphBuilder2, (void **)&pBuilder);
+	if (hr != S_OK) {
+		puts("Could not create capture graph builder");
+		goto out;
+	}
+
+	// Attach capture graph builder to graph
+	hr = ICaptureGraphBuilder2_SetFiltergraph(pBuilder, pGraph);
+	if (hr != S_OK) {
+		puts("Could not attach capture graph builder to graph");
+		goto out;
+	}
+
+	// hr = CoCreateInstance(&CLSID_SystemDeviceEnum, NULL,CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pDevEnum), NULL);
+	hr = CoCreateInstance(&CLSID_SystemDeviceEnum, NULL,CLSCTX_INPROC_SERVER, &IID_ICreateDevEnum, (LPVOID *)&pDevEnum);
+	if (hr != S_OK) {
+		puts("Could not crerate system device enumerator");
+		goto out;
+	}
+
+	// Video input device enumerator
+	hr = ICreateDevEnum_CreateClassEnumerator(pDevEnum, &CLSID_VideoInputDeviceCategory, &pEnum, 0);
+	if (hr != S_OK) {
+		puts("No video devices found");
+		goto out;
+	}
+	
+	VARIANT var;
+	for (int i = 0; i <= device_number; i++) {
+		hr = IEnumMoniker_Next(pEnum, 1, &pMoniker, NULL);
+		if (hr != S_OK) {
+			puts("not found");
+			return -1;
+		}
+		if (i != device_number) {
+			IMoniker_Release(pMoniker);
+		}
+	}
+	
+	hr = IMoniker_BindToObject(pMoniker, 0, 0, &IID_IBaseFilter, (LPVOID *)&pCap);
+	if (hr != S_OK) {
+		puts("Could not create capture filter");
+		goto out;
+	}
+		
+	hr = IGraphBuilder_AddFilter(pGraph, pCap, L"Capture Filter");
+	if (hr != S_OK) {
+		puts("Could not add capture filter to graph");
+		goto out;
+	}
+
+	hr = CoCreateInstance(&CLSID_SampleGrabber, NULL, CLSCTX_INPROC_SERVER, &IID_IBaseFilter, (LPVOID *)&pSampleGrabberFilter);
+	if (hr != S_OK) {
+		puts("Could not create Sample Grabber filter");
+		goto out;
+	}
+	
+	// Query the ISampleGrabber interface of the sample grabber filter
+	hr = IBaseFilter_QueryInterface(pSampleGrabberFilter, &IID_ISampleGrabber, (LPVOID *)&pSampleGrabber);
+	if (hr != S_OK) {
+		puts("Could not get ISampleGrabber interface to sample grabber filter");
+		goto out;
+	}
+
+	
+	// Enable sample buffering in the sample grabber filter
+	hr = ISampleGrabber_SetBufferSamples(pSampleGrabber, TRUE);
+	if (hr != S_OK) {
+		puts("Could not enable sample buffering in the sample grabber");
+		goto out;
+	}
+
+	// Set media type in sample grabber filter
+	AM_MEDIA_TYPE mediaType;
+	ZeroMemory(&mediaType, sizeof(AM_MEDIA_TYPE));
+	mediaType.majortype = MEDIATYPE_Video;
+	mediaType.subtype = MEDIASUBTYPE_RGB24;
+	hr = ISampleGrabber_SetMediaType(pSampleGrabber, (AM_MEDIA_TYPE *)&mediaType);
+	if (hr != S_OK) {
+		puts("Could not set media type in sample grabber");
+		goto out;
+	}
+	
+	// Add sample grabber filter to filter graph
+	hr = IGraphBuilder_AddFilter(pGraph, pSampleGrabberFilter, L"SampleGrab");
+	if (hr != S_OK) {
+		puts("Could not add Sample Grabber to filter graph");
+		goto out;
+	}
+
+	// Create Null Renderer filter
+	hr = CoCreateInstance(&CLSID_NullRenderer, NULL,
+		CLSCTX_INPROC_SERVER, &IID_IBaseFilter,
+		(void**)&pNullRenderer);
+	if (hr != S_OK) {
+		puts("Could not create Null Renderer filter");
+		goto out;
+	}
+	
+	// Add Null Renderer filter to filter graph
+	hr = IGraphBuilder_AddFilter(pGraph, pNullRenderer, L"NullRender");
+	if (hr != S_OK) {
+		puts("Could not add Null Renderer to filter graph");
+		goto out;
+	}
+	
+	// Connect up the filter graph's capture stream
+	hr = ICaptureGraphBuilder2_RenderStream(pBuilder, &PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video, (IUnknown *)pCap,  pSampleGrabberFilter, pNullRenderer);
+	if (hr != S_OK) {
+		puts("Could not render capture video stream");
+		goto out;
+	}
+		
+	// Get media control interfaces to graph builder object
+	hr = IGraphBuilder_QueryInterface(pGraph, &IID_IMediaControl, (void**)&pMediaControl);
+	if (hr != S_OK) {
+		puts("Could not get media control interface");
+		goto out;
+	}
+	
+	hr = S_FALSE;
+	while (hr != S_OK) {
+		hr = IMediaControl_Run(pMediaControl);
+	}
+	Sleep(2000);
+	
+	LONG iBufferSize = 0;
+	while(1) {
+		// checking the required buffer size
+		hr = ISampleGrabber_GetCurrentBuffer(pSampleGrabber, &iBufferSize, NULL);
+		
+		// Keep trying until buffer_size is set to non-zero value.
+		if (hr == S_OK && iBufferSize != 0)
+			break;
+		// something has gone wrong
+		if (hr != S_OK &&hr != VFW_E_WRONG_STATE) {
+			puts("Could not get buffer size");
+			goto out;
+		}
+	}
+
+	IMediaControl_Stop(pMediaControl);
+
+	pBuffer = malloc(iBufferSize);
+	if (!pBuffer) {
+		puts("malloc");
+		goto out;
+	}
+	
+	// Retrieve image data from sample grabber buffer
+	hr = ISampleGrabber_GetCurrentBuffer(pSampleGrabber, &iBufferSize, (long*)pBuffer);
+	if (hr != S_OK) {
+		puts("Could not get buffer data from sample grabber");
+		goto out;
+	}
+
+	// Get the media type from the sample grabber filter
+	hr = ISampleGrabber_GetConnectedMediaType(pSampleGrabber, (AM_MEDIA_TYPE *)&mediaType);
+	if (hr != S_OK) {
+		puts("Could not get media type");
+		goto out;
+	}
+	
+	if ( !IsEqualGUID(&mediaType.formattype, &FORMAT_VideoInfo)
+			|| (mediaType.cbFormat < sizeof(VIDEOINFOHEADER))
+			|| (mediaType.pbFormat == NULL)) {
+		puts("Wrong media type");
+		goto out;
+	}
+
+	SaveImage("image.bmp", &mediaType, pBuffer, iBufferSize);
+	VIDEOINFOHEADER *pVih = (VIDEOINFOHEADER*)mediaType.pbFormat;
+	RGB24BufferToJpeg(pBuffer, pVih->bmiHeader.biWidth, pVih->bmiHeader.biHeight, L"image.jpg");
+	
+	// Free the format block
+	if (mediaType.cbFormat) {
+		CoTaskMemFree((PVOID)mediaType.pbFormat);
+		mediaType.cbFormat = 0;
+		mediaType.pbFormat = NULL;
+	}
+
+	if (mediaType.pUnk) {
+		IUnknown_Release(mediaType.pUnk);
+		mediaType.pUnk = NULL;
+	}
+
+	retval = 0;
+out:
+	if (pBuffer)
+		free(pBuffer);
+	if (pMediaControl)
+		IMediaControl_Release(pMediaControl);	
+	if (pNullRenderer) 
+		IBaseFilter_Release(pNullRenderer);
+	if (pSampleGrabber)
+		ISampleGrabber_Release(pSampleGrabber);
+	if (pSampleGrabberFilter)
+		IBaseFilter_Release(pSampleGrabberFilter);
+	if (pCap)
+		IBaseFilter_Release(pCap);
+	if (pBuilder)
+		ICaptureGraphBuilder2_Release(pCap);
+	if (pGraph)
+		IGraphBuilder_Release(pGraph);
+	if (pPropBag)
+		IPropertyBag_Release(pPropBag);
+	if (pMoniker)
+		IMoniker_Release(pMoniker);
+	if (pEnum)
+		IEnumMoniker_Release(pEnum);
+	if (pDevEnum)
+		ICreateDevEnum_Release(pDevEnum);
+	return retval;
+}
+
+
+int RGB24BufferToJpeg(LPBYTE buffer, int width, int height,LPCWSTR filePath)
+{
+	int retval = -1;
+        IWICImagingFactory* piFactory = NULL;
+        IWICBitmapEncoder* piEncoder = NULL;
+        IWICBitmapFrameEncode* piBitmapFrame = NULL;
+        IWICStream* piStream = NULL;
+        IWICBitmap* piBitmapSrc = NULL;
+        IWICFormatConverter* piFormatConverter = NULL;
+        IWICBitmapSource* piBitmapTmp = NULL;
+        IPropertyBag2* pPropertybag = NULL;
+
+        // CoInitialize(NULL);
+        HRESULT hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (LPVOID*)&piFactory);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICImagingFactory_CreateStream(piFactory, &piStream);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICStream_InitializeFromFilename(piStream, filePath, GENERIC_WRITE);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICImagingFactory_CreateEncoder(piFactory, &GUID_ContainerFormatJpeg, NULL, &piEncoder);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICBitmapEncoder_Initialize(piEncoder, (IStream *)piStream, WICBitmapEncoderNoCache);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICBitmapEncoder_CreateNewFrame(piEncoder, &piBitmapFrame, &pPropertybag);
+	if (FAILED(hr))
+		goto out;
+
+	PROPBAG2 option = {0};
+	option.pstrName = (LPOLESTR)L"BitmapTransform";
+	VARIANT varValue;
+	VariantInit(&varValue);
+	varValue.vt = VT_UI1;
+	varValue.bVal = WICBitmapTransformRotate180;
+	hr = IPropertyBag2_Write(pPropertybag, 1, &option, &varValue);
+	if (FAILED(hr))
+		goto out;
+	hr = IWICBitmapFrameEncode_Initialize(piBitmapFrame, pPropertybag);
+	if (FAILED(hr))
+		goto out;
+	hr = IWICBitmapFrameEncode_SetSize(piBitmapFrame, width, height);
+	if (FAILED(hr))
+		goto out;
+	// hr = IWICImagingFactory_CreateBitmapFromMemory(piFactory, width, height, &GUID_WICPixelFormat32bppRGBA, width * 4, height * width * 4, buffer, &piBitmapSrc);
+	hr = IWICImagingFactory_CreateBitmapFromMemory(piFactory, width, height, &GUID_WICPixelFormat24bppBGR, width * 3, height * width * 3, buffer, &piBitmapSrc);
+	if (FAILED(hr))
+		goto out;
+
+	hr = IWICImagingFactory_CreateFormatConverter(piFactory, &piFormatConverter);
+	if (FAILED(hr))
+		goto out;
+
+        // Initialize the format converter.
+	hr = IWICFormatConverter_Initialize(piFormatConverter,
+			(IWICBitmapSource *)piBitmapSrc,// Input source to convert
+			&GUID_WICPixelFormat24bppBGR,   // Destination pixel format
+			WICBitmapDitherTypeNone,        // Specified dither pattern
+			NULL,                           // Specify a particular palette
+			0.f,                            // Alpha threshold
+			WICBitmapPaletteTypeCustom      // Palette translation type
+			);
+
+
+        if (FAILED(hr))
+		goto out;
+	hr = IWICFormatConverter_QueryInterface(piFormatConverter, &IID_IWICBitmapSource, (void **)&piBitmapTmp);
+        if (FAILED(hr))
+		goto out;
+	hr = IWICBitmapFrameEncode_WriteSource(piBitmapFrame, piBitmapTmp, NULL);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICBitmapFrameEncode_Commit(piBitmapFrame);
+        if (FAILED(hr))
+		goto out;
+
+	hr = IWICBitmapEncoder_Commit(piEncoder);
+
+	retval = 0;
+out:
+
+        if (piBitmapTmp)
+		IWICBitmapSource_Release(piBitmapTmp);
+
+        if (piFormatConverter)
+		IWICFormatConverter_Release(piFormatConverter);
+
+        if (piBitmapSrc)
+		IWICBitmap_Release(piBitmapSrc);
+
+        if (piEncoder)
+		IWICBitmapEncoder_Release(piEncoder);
+
+	if (piBitmapFrame)
+		IWICBitmapFrameEncode_Release(piBitmapFrame);
+
+        if (pPropertybag)
+		IPropertyBag2_Release(pPropertybag);
+
+        if (piStream)
+		IWICStream_Release(piStream);
+
+        if (piFactory)
+		IWICImagingFactory_Release(piFactory);
+	return retval;
+
+}
+
+int main(int argc, char **argv)
+{
+
+	HRESULT hr;
+	// Intialise COM
+	hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	if (hr != S_OK) {
+		puts("Could not initialise COM");
+		goto out;
+	}
+	Capture();
+	// ListDevice();
+	CoUninitialize();
+out:;
+	return 0;
+}
